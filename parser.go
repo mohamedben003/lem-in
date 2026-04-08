@@ -26,8 +26,7 @@ func parseFile(filename string) (*Colony, error) {
 	if err != nil {
 		return nil, fmt.Errorf("ERROR: invalid data format, cannot read file")
 	}
-
-	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	lines := strings.Split(string(data), "\n")
 	colony := &Colony{
 		rooms: make(map[string]*Room),
 		links: make(map[string][]string),
@@ -54,10 +53,6 @@ func parseFile(filename string) (*Colony, error) {
 	for i := 1; i < len(lines); i++ {
 		line := strings.TrimSpace(lines[i])
 
-		if line == "" {
-			continue
-		}
-
 		if line == "##start" {
 			nextIsStart = true
 			rawLines = append(rawLines, line)
@@ -68,23 +63,24 @@ func parseFile(filename string) (*Colony, error) {
 			rawLines = append(rawLines, line)
 			continue
 		}
-		// Skip comments but don't add to raw
-		if strings.HasPrefix(line, "#") {
+
+		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-
 		// Try to parse as a link
 		if strings.Contains(line, "-") && !strings.Contains(line, " ") {
 			parts := strings.Split(line, "-")
 			if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
 				a, b := parts[0], parts[1]
-				if _, ok := colony.rooms[a]; !ok {
-					rawLines = append(rawLines, line)
-					continue
+
+				if a == b {
+					return nil, fmt.Errorf("ERROR: invalid data format, self-link not allowed: %s-%s", a, b)
 				}
-				if _, ok := colony.rooms[b]; !ok {
-					rawLines = append(rawLines, line)
-					continue
+				if ok := colony.rooms[a]; ok == nil {
+					return nil, fmt.Errorf("ERROR: invalid data format, unknown room '%s' in link", a)
+				}
+				if ok := colony.rooms[b]; ok == nil {
+					return nil, fmt.Errorf("ERROR: invalid data format, unknown room '%s' in link", b)
 				}
 				// Check duplicate links
 				for _, existing := range colony.links[a] {

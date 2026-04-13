@@ -1,49 +1,42 @@
 package main
-
+ 
 import (
 	"fmt"
 	"strings"
 )
-
-type Ant struct {
-	id       int
-	path     []string
-	step     int
-	released bool
-	done     bool
-}
-
+ 
+// simulate runs the ant colony turn by turn and returns each turn's moves
+// as a slice of strings like ["L1-3 L2-2", "L1-4 L2-5 L3-3", ...].
 func simulate(colony *Colony, paths [][]string) []string {
+	// Sort paths shortest-first so we fill the fastest lanes first.
 	sorted := sortPaths(paths)
-	assignment := distributeAnts(colony.numAnts, sorted)
  
-	// Build ant list per path, but number ants in interleaved release order.
-	// e.g. with paths A(3 ants) and B(2 ants): release order is A,B,A,B,A
-	// so ant IDs go: A[0]=1, B[0]=2, A[1]=3, B[1]=4, A[2]=5
-	pathCount := make([]int, len(sorted))
-	for i, c := range assignment {
-		pathCount[i] = c
+	// Decide how many ants travel each path (greedy by finish-turn).
+	counts := distributeAnts(colony.numAnts, sorted)
+ 
+	// ── Build ant list ────────────────────────────────────────
+	// We number ants in round-robin release order across paths.
+	// Example: path A gets 3 ants, path B gets 2 →
+	//   ant 1 = A, ant 2 = B, ant 3 = A, ant 4 = B, ant 5 = A
+	type ant struct {
+		id   int
+		path []string
+		step int  // index into path; 0 = at start, len(path)-1 = at end
+		done bool
 	}
  
-	// queues[pathIdx] = slice of ants waiting to enter that path (in release order)
-	queues := make([][]*Ant, len(sorted))
-	for i := range queues {
-		queues[i] = make([]*Ant, 0, pathCount[i])
-	}
- 
+	// queues[pathIdx] holds the ants queued for that path (in release order).
+	queues := make([][]*ant, len(sorted))
 	antID := 1
-	released := make([]int, len(sorted)) // how many assigned so far per path
+	assigned := make([]int, len(sorted))
 	total := 0
+ 
 	for total < colony.numAnts {
-		for pathIdx := range sorted {
-			if released[pathIdx] < pathCount[pathIdx] {
-				queues[pathIdx] = append(queues[pathIdx], &Ant{
-					id:   antID,
-					path: sorted[pathIdx],
-					step: 0,
-				})
+		for pi := range sorted {
+			if assigned[pi] < counts[pi] {
+				queues[pi] = append(queues[pi], &ant{id: antID, path: sorted[pi]})
 				antID++
-				released[pathIdx]++
+				assigned[pi]++
 				total++
 				if total >= colony.numAnts {
 					break
@@ -52,49 +45,55 @@ func simulate(colony *Colony, paths [][]string) []string {
 		}
 	}
  
-	// Flatten into ants slice with pathStart offsets
-	ants := make([]*Ant, 0, colony.numAnts)
+	// Flatten into a single slice with per-path start offsets for fast access.
+	ants := make([]*ant, 0, colony.numAnts)
 	pathStart := make([]int, len(sorted))
-	for pathIdx, q := range queues {
-		pathStart[pathIdx] = len(ants)
+	for pi, q := range queues {
+		pathStart[pi] = len(ants)
 		ants = append(ants, q...)
 	}
  
+	// nextRelease[pi] = how many ants on path pi have been released so far.
 	nextRelease := make([]int, len(sorted))
+ 
 	var moves []string
 	totalDone := 0
-
+ 
+	// ── Main simulation loop ──────────────────────────────────
 	for totalDone < colony.numAnts {
-		// Track occupied rooms AND used tunnels this turn
+		// occupied tracks intermediate rooms currently holding an ant.
+		// (start and end can hold any number of ants simultaneously.)
 		occupied := map[string]bool{}
-		usedTunnel := map[[2]string]bool{} // (from, to) tunnel used
-
-		// Pre-mark rooms occupied by released ants at current positions
-		for _, ant := range ants {
-			if ant.released && !ant.done {
-				room := ant.path[ant.step]
+		// usedTunnel prevents two ants from crossing the same tunnel in one turn.
+		usedTunnel := map[[2]string]bool{}
+ 
+		// Pre-mark rooms occupied by released ants at their current positions.
+		for _, a := range ants {
+			if a.step > 0 && !a.done {
+				room := a.path[a.step]
 				if room != colony.start && room != colony.end {
 					occupied[room] = true
 				}
 			}
 		}
-
+ 
 		var turnMoves []string
-
-		// Move released ants — furthest first per path
-		for pathIdx := range sorted {
-			path := sorted[pathIdx]
-			start := pathStart[pathIdx]
-			count := pathCount[pathIdx]
-
-			// Collect active ants on this path, sorted by step desc
-			var active []*Ant
+ 
+		// ── Step 1: move already-released ants (furthest first) ──
+		for pi, path := range sorted {
+			start := pathStart[pi]
+			count := counts[pi]
+ 
+			// Collect active ants on this path and sort by step descending
+			// so the ant closest to the end moves first (avoids blocking).
+			active := make([]*ant, 0, count)
 			for i := start; i < start+count; i++ {
 				a := ants[i]
-				if a.released && !a.done {
+				if a.step > 0 && !a.done {
 					active = append(active, a)
 				}
 			}
+			// Simple sort: largest step first.
 			for i := 0; i < len(active)-1; i++ {
 				for j := i + 1; j < len(active); j++ {
 					if active[i].step < active[j].step {
@@ -102,82 +101,79 @@ func simulate(colony *Colony, paths [][]string) []string {
 					}
 				}
 			}
-
-			for _, ant := range active {
-				nextStep := ant.step + 1
+ 
+			for _, a := range active {
+				nextStep := a.step + 1
 				if nextStep >= len(path) {
 					continue
 				}
-				curRoom := path[ant.step]
-				nextRoom := path[nextStep]
-				tunnel := [2]string{curRoom, nextRoom}
-
-				roomFree := nextRoom == colony.end || !occupied[nextRoom]
+				from := path[a.step]
+				to := path[nextStep]
+				tunnel := [2]string{from, to}
+ 
+				roomFree := to == colony.end || !occupied[to]
 				tunnelFree := !usedTunnel[tunnel]
-
+ 
 				if roomFree && tunnelFree {
+					// Mark the tunnel used in both directions.
 					usedTunnel[tunnel] = true
-					usedTunnel[[2]string{nextRoom, curRoom}] = true
-					if curRoom != colony.start && curRoom != colony.end {
-						occupied[curRoom] = false
+					usedTunnel[[2]string{to, from}] = true
+					// Free the room the ant just left, occupy the new one.
+					if from != colony.start && from != colony.end {
+						occupied[from] = false
 					}
-					if nextRoom != colony.end {
-						occupied[nextRoom] = true
+					if to != colony.end {
+						occupied[to] = true
 					}
-					ant.step = nextStep
-					turnMoves = append(turnMoves, fmt.Sprintf("L%d-%s", ant.id, nextRoom))
-					if nextRoom == colony.end {
-						ant.done = true
+					a.step = nextStep
+					turnMoves = append(turnMoves, fmt.Sprintf("L%d-%s", a.id, to))
+					if to == colony.end {
+						a.done = true
 						totalDone++
 					}
 				}
 			}
 		}
-
-		// Release one new ant per path per turn
-		for pathIdx := range sorted {
-			if nextRelease[pathIdx] >= pathCount[pathIdx] {
+ 
+		// ── Step 2: release one new ant per path ─────────────────
+		for pi, path := range sorted {
+			if nextRelease[pi] >= counts[pi] || len(path) < 2 {
 				continue
 			}
-			path := sorted[pathIdx]
-			if len(path) < 2 {
-				continue
-			}
-			antIdx := pathStart[pathIdx] + nextRelease[pathIdx]
-			ant := ants[antIdx]
+			antIdx := pathStart[pi] + nextRelease[pi]
+			a := ants[antIdx]
 			firstRoom := path[1]
 			tunnel := [2]string{colony.start, firstRoom}
-
+ 
 			roomFree := firstRoom == colony.end || !occupied[firstRoom]
 			tunnelFree := !usedTunnel[tunnel]
-
+ 
 			if roomFree && tunnelFree {
 				usedTunnel[tunnel] = true
 				usedTunnel[[2]string{firstRoom, colony.start}] = true
 				if firstRoom != colony.end {
 					occupied[firstRoom] = true
 				}
-				ant.step = 1
-				ant.released = true
-				nextRelease[pathIdx]++
-				turnMoves = append(turnMoves, fmt.Sprintf("L%d-%s", ant.id, firstRoom))
+				a.step = 1
+				nextRelease[pi]++
+				turnMoves = append(turnMoves, fmt.Sprintf("L%d-%s", a.id, firstRoom))
 				if firstRoom == colony.end {
-					ant.done = true
+					a.done = true
 					totalDone++
 				}
 			}
 		}
-
-		if len(turnMoves) > 0 {
-			moves = append(moves, strings.Join(turnMoves, " "))
-		} else {
-			break // safety: no progress possible
+ 
+		if len(turnMoves) == 0 {
+			break // no progress — should not happen on valid input
 		}
+		moves = append(moves, strings.Join(turnMoves, " "))
 	}
-
+ 
 	return moves
 }
-
+ 
+// sortPaths returns a copy of paths sorted shortest-first.
 func sortPaths(paths [][]string) [][]string {
 	sorted := make([][]string, len(paths))
 	copy(sorted, paths)
@@ -190,3 +186,4 @@ func sortPaths(paths [][]string) [][]string {
 	}
 	return sorted
 }
+ 
